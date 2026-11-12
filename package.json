@@ -1,0 +1,12 @@
+{
+  "name": "week09-board",
+  "version": "1.0.0",
+  "description": "웹서비스설계 9주차 검색·정렬·페이지네이션 게시판 개선",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

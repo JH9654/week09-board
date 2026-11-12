@@ -6,16 +6,19 @@
  *   3) 오프셋 페이징 API (/api/posts) + 표준 meta Envelope
  *   4) 고성능 커서 기반(Keyset) 페이징 API (/api/posts/cursor)
  *
+ *
  * 실행 방법:
  *   1) npm install express
  *   2) node server.js
  *   3) 브라우저에서 http://localhost:3000 접속
+ *   (느린 응답 테스트) Windows PowerShell: $env:DELAY_MS=1500; node server.js
+ *                      macOS / Linux    : DELAY_MS=1500 node server.js
  */
 
 const express = require('express');
-const path = require('path');
 const app = express();
 const PORT = 3000;
+const DELAY_MS = parseInt(process.env.DELAY_MS, 10) || 0; // [수정 7]
 
 app.use(express.static(__dirname)); // 현재 폴더의 index.html 정적 서빙
 app.use(express.json());
@@ -37,27 +40,68 @@ const TOPICS = [
 ];
 const AUTHORS = ['이경수', '김철수', '이영희', '박민수', '정다은', '최준호', '강서연', '윤성호'];
 
+const BASE_DATE = Date.UTC(2026, 0, 1);
+function makeCreatedAt(id) {
+  const dayOffset = Math.floor((id - 1) * 0.3); // 약 3~4개 글이 같은 날짜
+  return new Date(BASE_DATE + dayOffset * 86400000).toISOString().slice(0, 10);
+}
+
 const POSTS = Array.from({ length: 1000 }, (_, i) => {
   const id = 1000 - i;
   const topic = TOPICS[i % TOPICS.length];
   const author = AUTHORS[i % AUTHORS.length];
   const views = Math.floor(Math.random() * 5000) + 10;
-  const dateNum = String(1000 - i).padStart(4, '0');
   return {
     id,
     title: `[#${id}] ${topic}`,
     content: `게시글 ${id}번의 상세 본문 데이터입니다. DB 인덱스와 페이징 최적화를 실습합니다.`,
     author,
     views,
-    createdAt: `2026-${(10 - Math.floor(i / 150)).toString().padStart(2, '0')}-${((i % 28) + 1).toString().padStart(2, '0')}`
+    createdAt: makeCreatedAt(id)
   };
 });
 
+const byDateDesc = (a, b) => (a.createdAt !== b.createdAt ? (a.createdAt < b.createdAt ? 1 : -1) : b.id - a.id);
+const byDateAsc = (a, b) => (a.createdAt !== b.createdAt ? (a.createdAt < b.createdAt ? -1 : 1) : a.id - b.id);
+
 // 화이트리스트 정렬 정의 (동점자 방지 id 결합)
 const SORT_WHITELIST = Object.freeze({
-  latest: (a, b) => b.id - a.id,
-  oldest: (a, b) => a.id - b.id,
-  views: (a, b) => (b.views !== a.views ? b.views - a.views : b.id - a.id)
+  latest: byDateDesc,                                                     // created_at DESC, id DESC
+  oldest: byDateAsc,                                                      // created_at ASC,  id ASC
+  views: (a, b) => (b.views !== a.views ? b.views - a.views : b.id - a.id) // views DESC, id DESC
+});
+
+// ==========================================
+// 공통 파라미터 정제 함수
+// ==========================================
+
+function toStr(value) {
+  if (Array.isArray(value)) value = value[0];
+  return typeof value === 'string' ? value : '';
+}
+
+function resolveSort(rawSort) {
+  const key = toStr(rawSort);
+  return Object.hasOwn(SORT_WHITELIST, key) ? key : 'latest';
+}
+
+function parsePositiveInt(value, fallback) {
+  const n = parseInt(toStr(value), 10);
+  return (!isNaN(n) && n > 0) ? n : fallback;
+}
+function parseLimit(value, max) {
+  return Math.min(parsePositiveInt(value, 10), max);
+}
+
+// 제목·본문 검색 (WHERE title LIKE '%kw%' OR content LIKE '%kw%')
+function matchesSearch(post, search) {
+  if (!search) return true;
+  return post.title.toLowerCase().includes(search) || post.content.toLowerCase().includes(search);
+}
+
+app.use('/api', (req, res, next) => {
+  if (!DELAY_MS) return next();
+  setTimeout(next, Math.floor(Math.random() * DELAY_MS));
 });
 
 // ==========================================
@@ -68,24 +112,19 @@ app.get('/api/posts', (req, res) => {
   const startTime = process.hrtime();
 
   // 파라미터 정제 및 방어 코딩
-  const rawPage = parseInt(req.query.page, 10);
-  const rawLimit = parseInt(req.query.limit, 10);
-  const page = (!isNaN(rawPage) && rawPage > 0) ? rawPage : 1;
-  const limit = (!isNaN(rawLimit) && rawLimit > 0) ? Math.min(rawLimit, 100) : 10;
-  const search = (req.query.search || '').trim().toLowerCase();
-  const sortKey = req.query.sort || 'latest';
+  const page = parsePositiveInt(req.query.page, 1);
+  const limit = parseLimit(req.query.limit, 100);
+  const search = toStr(req.query.search).trim().toLowerCase();
+  const sortKey = resolveSort(req.query.sort);
 
-  // 1) 검색 필터링 (WHERE title LIKE '%search%')
-  let filtered = POSTS.filter(p => {
-    if (!search) return true;
-    return p.title.toLowerCase().includes(search) || p.content.toLowerCase().includes(search);
-  });
+  // 1) 검색 필터링 (WHERE title LIKE '%search%' OR content LIKE '%search%')
+  const filtered = POSTS.filter(p => matchesSearch(p, search));
 
   // 2) 화이트리스트 정렬 (ORDER BY ...)
-  const sortComparator = SORT_WHITELIST[sortKey] || SORT_WHITELIST.latest;
-  filtered.sort(sortComparator);
+  filtered.sort(SORT_WHITELIST[sortKey]);
 
   // 3) 오프셋 계산 및 데이터 슬라이싱
+  //    totalPages = ceil(totalCount / limit), offset = (page - 1) * limit
   const totalCount = filtered.length;
   const totalPages = Math.max(1, Math.ceil(totalCount / limit));
   const safePage = Math.min(page, totalPages);
@@ -101,6 +140,8 @@ app.get('/api/posts', (req, res) => {
     meta: {
       page: safePage,
       limit,
+      sort: sortKey,
+      search,
       totalCount,
       totalPages,
       hasNext: safePage < totalPages,
@@ -112,25 +153,26 @@ app.get('/api/posts', (req, res) => {
 
 // ==========================================
 // 2. 커서 기반(Keyset) 페이지네이션 API
-// GET /api/posts/cursor?cursor=950&limit=10
+// GET /api/posts/cursor?cursor=950&limit=10&search=redis
+//  → SELECT ... WHERE (title LIKE ? OR content LIKE ?) AND id < ? ORDER BY id DESC LIMIT 11
 // ==========================================
 app.get('/api/posts/cursor', (req, res) => {
   const startTime = process.hrtime();
 
-  const rawCursor = parseInt(req.query.cursor, 10);
-  const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 50);
+  const cursor = parsePositiveInt(req.query.cursor, null); // 0, 음수, abc → 처음부터
+  const limit = parseLimit(req.query.limit, 50);
+  const search = toStr(req.query.search).trim().toLowerCase();
 
-  // 커서가 있으면 해당 id보다 작은 항목들만 탐색 (WHERE id < ? ORDER BY id DESC)
-  let candidate = POSTS;
-  if (!isNaN(rawCursor) && rawCursor > 0) {
-    candidate = POSTS.filter(p => p.id < rawCursor);
-  }
+  const candidate = POSTS
+    .filter(p => matchesSearch(p, search))
+    .filter(p => cursor === null || p.id < cursor)
+    .sort((a, b) => b.id - a.id);
 
   // limit + 1개를 조회하여 다음 데이터 존재 여부(hasNext) 판단 (COUNT(*) 제거)
   const sliced = candidate.slice(0, limit + 1);
   const hasNext = sliced.length > limit;
   const items = hasNext ? sliced.slice(0, limit) : sliced;
-  const nextCursor = items.length > 0 ? items[items.length - 1].id : null;
+  const nextCursor = hasNext ? items[items.length - 1].id : null; // 다음 페이지가 없으면 null
 
   const diff = process.hrtime(startTime);
   const executionTimeMs = (diff[0] * 1000 + diff[1] / 1e6).toFixed(2);
@@ -139,9 +181,11 @@ app.get('/api/posts/cursor', (req, res) => {
   res.json({
     items,
     meta: {
-      cursor: rawCursor || null,
+      cursor,
       nextCursor,
       limit,
+      search,
+      orderBy: 'id DESC',
       hasNext,
       executionTimeMs: Number(executionTimeMs)
     }
@@ -153,5 +197,6 @@ app.listen(PORT, () => {
   console.log(`🚀 웹서비스설계 9주차 3학년 전공 실습 서버 구동 완료`);
   console.log(`📡 URL: http://localhost:${PORT}`);
   console.log(`📦 데이터: 1,000건의 인메모리 게시글 로드 완료`);
+  if (DELAY_MS) console.log(`🐢 테스트 모드: API 응답을 0~${DELAY_MS}ms 랜덤 지연`);
   console.log(`====================================================`);
 });

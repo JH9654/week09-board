@@ -55,7 +55,7 @@
       color: var(--muted);
       margin: 0;
     }
-    
+
     /* Mode Switcher Tabs */
     .tab-bar {
       display: flex;
@@ -106,6 +106,7 @@
       font-size: 14px;
       background: white;
     }
+    .select-box:disabled { background: var(--light); color: var(--muted); }
     .btn {
       padding: 8px 16px;
       background: var(--primary);
@@ -117,6 +118,23 @@
       cursor: pointer;
     }
     .btn:hover { background: #0052a3; }
+    .btn:disabled { background: #a9b4c4; cursor: not-allowed; }
+
+    .mode-note {
+      display: none;
+      margin: -6px 0 14px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .error-box {
+      display: none;
+      margin-bottom: 12px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      background: #fdecec;
+      color: var(--danger);
+      font-size: 13.5px;
+    }
 
     /* Data Table */
     .table-wrap {
@@ -169,7 +187,11 @@
     .more-wrap {
       display: flex;
       justify-content: center;
+      align-items: center;
+      gap: 12px;
       margin-top: 20px;
+      font-size: 13px;
+      color: var(--muted);
     }
 
     /* DevTools Inspector */
@@ -231,6 +253,10 @@
       <button class="btn" onclick="applySearch()">조회</button>
     </div>
 
+    <p class="mode-note" id="modeNote">커서 모드는 <b>ID 내림차순(id DESC)</b>으로 고정되어 정렬 선택이 비활성화됩니다. 검색은 그대로 적용됩니다.</p>
+
+    <div class="error-box" id="errorBox"></div>
+
     <div class="table-wrap">
       <table class="data-table">
         <thead>
@@ -239,7 +265,7 @@
             <th>제목</th>
             <th style="width:80px;">작성자</th>
             <th style="width:75px;">조회수</th>
-            <th style="width:95px;">작성일</th>
+            <th style="width:110px;">작성일</th>
           </tr>
         </thead>
         <tbody id="tableBody">
@@ -253,6 +279,7 @@
 
     <!-- 커서 기반 [더보기] 버튼 -->
     <div class="more-wrap" id="cursorMoreWrap" style="display:none;">
+      <span id="cursorCount"></span>
       <button class="btn" id="btnMore" onclick="loadMoreCursor()">다음 10개 더 불러오기 (Keyset)</button>
     </div>
   </div>
@@ -266,7 +293,7 @@
 
     <div>
       <div class="inspector-title">
-        <span>① 전송된 HTTP 요청 URL</span>
+        <span>① 전송된 HTTP 요청 URL <small id="reqCounter" style="color:var(--muted); font-weight:600;"></small></span>
         <span class="badge-latency" id="latencyBadge">0.00ms</span>
       </div>
       <div class="code-block" id="inspectUrl">GET /api/posts?page=1&limit=10&sort=latest</div>
@@ -292,6 +319,9 @@
 </div>
 
 <script>
+
+  const ALLOWED_SORTS = ['latest', 'views', 'oldest'];
+
   let mode = 'offset'; // 'offset' or 'cursor'
   let state = {
     page: 1,
@@ -304,82 +334,170 @@
   let cursorPosts = []; // 커서 모드 누적 아이템
   let currentAbortController = null;
   let debounceTimer = null;
+  let requestSeq = 0;
 
-  // 모드 변경 (오프셋 vs 커서)
-  function switchMode(newMode) {
-    mode = newMode;
+  function normalizeSort(value) {
+    return ALLOWED_SORTS.includes(value) ? value : 'latest';
+  }
+  function normalizePage(value) {
+    const n = parseInt(value, 10);
+    return (!isNaN(n) && n > 0) ? n : 1;
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function buildOffsetQuery() {
+    const q = new URLSearchParams({
+      page: state.page,
+      limit: state.limit,
+      sort: state.sort
+    });
+    if (state.search) q.set('search', state.search);
+    return q;
+  }
+
+  function syncUrl(method) {
+    const next = `?${buildOffsetQuery().toString()}`;
+    if (next === window.location.search) return;
+    if (method === 'replace') window.history.replaceState({}, '', next);
+    else window.history.pushState({}, '', next);
+  }
+
+  function restoreFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    state.page = normalizePage(params.get('page'));
+    state.sort = normalizeSort(params.get('sort'));
+    state.search = (params.get('search') || '').trim();
+    state.cursor = null;
+
+    document.getElementById('searchInput').value = state.search;
+    document.getElementById('sortSelect').value = state.sort;
+  }
+
+  function applyModeUi() {
     document.getElementById('tabOffset').classList.toggle('active', mode === 'offset');
     document.getElementById('tabCursor').classList.toggle('active', mode === 'cursor');
     document.getElementById('paginationBar').style.display = (mode === 'offset') ? 'flex' : 'none';
     document.getElementById('cursorMoreWrap').style.display = (mode === 'cursor') ? 'flex' : 'none';
+    document.getElementById('sortSelect').disabled = (mode === 'cursor');
+    document.getElementById('modeNote').style.display = (mode === 'cursor') ? 'block' : 'none';
+  }
+
+  // 모드 변경 (오프셋 vs 커서)
+  function switchMode(newMode) {
+    if (mode === newMode) return;
+    mode = newMode;
+    applyModeUi();
 
     state.page = 1;
     state.cursor = null;
     cursorPosts = [];
-    loadData(true);
+    // 오프셋으로 돌아올 때만 URL 기록 (URL 동기화 대상은 오프셋 모드)
+    loadData({ history: mode === 'offset' ? 'push' : null, reset: true });
   }
 
   // 데이터 로드
-  async function loadData(pushHistory = false) {
+  // options.history : 'push' | 'replace' | null  (주소창 기록 방식)
+  // options.reset   : true 면 커서 목록을 비우고 처음부터, false 면 이어 붙이기
+  async function loadData({ history = null, reset = true } = {}) {
     if (currentAbortController) {
       currentAbortController.abort(); // 이전 진행 요청 즉시 취소
     }
     currentAbortController = new AbortController();
     const { signal } = currentAbortController;
+    const seq = ++requestSeq;
+    const reqMode = mode;
+    const reqState = { ...state };
+
+    if (reqMode === 'cursor' && reset) {
+      cursorPosts = [];
+      state.cursor = null;
+      reqState.cursor = null;
+    }
 
     const t0 = performance.now();
     let endpoint = '';
 
-    if (mode === 'offset') {
-      const q = new URLSearchParams({
-        page: state.page,
-        limit: state.limit,
-        sort: state.sort
-      });
-      if (state.search) q.set('search', state.search);
-      endpoint = `/api/posts?${q.toString()}`;
-
-      if (pushHistory) {
-        window.history.pushState({}, '', `?${q.toString()}`);
-      }
+    if (reqMode === 'offset') {
+      endpoint = `/api/posts?${buildOffsetQuery().toString()}`;
+      if (history) syncUrl(history);
     } else {
       const q = new URLSearchParams({ limit: state.limit });
-      if (state.cursor) q.set('cursor', state.cursor);
+      if (reqState.search) q.set('search', reqState.search);
+      if (reqState.cursor) q.set('cursor', reqState.cursor);
       endpoint = `/api/posts/cursor?${q.toString()}`;
+      document.getElementById('btnMore').disabled = true;    // 로딩 중 중복 클릭 방지
     }
 
     document.getElementById('inspectUrl').textContent = `GET ${endpoint}`;
+    document.getElementById('reqCounter').textContent = `(요청 #${seq})`;
+    console.log(`[요청 #${seq}] GET ${endpoint}`);
 
     try {
       const res = await fetch(endpoint, { signal });
+      if (!res.ok) throw new Error(`서버 오류 (HTTP ${res.status})`);
       const json = await res.json();
-      const t1 = performance.now();
 
+      if (signal.aborted || seq !== requestSeq) {
+        console.log(`[요청 #${seq}] 오래된 응답이라 화면에 반영하지 않음`);
+        return;
+      }
+
+      const t1 = performance.now();
+      hideError();
       document.getElementById('latencyBadge').textContent = `${(t1 - t0).toFixed(2)}ms`;
       document.getElementById('inspectJson').textContent = JSON.stringify(json, null, 2);
 
-      // SQL 미리보기 업데이트
-      updateSqlInspector();
+      if (reqMode === 'offset') {
+        state.page = json.meta.page;
+        state.sort = json.meta.sort || state.sort;
+        document.getElementById('sortSelect').value = state.sort;
+        syncUrl('replace');
 
-      if (mode === 'offset') {
+        updateSqlInspector(reqMode, { ...reqState, page: json.meta.page });
         renderTable(json.items);
         renderPagination(json.meta.page, json.meta.totalPages);
       } else {
-        if (!state.cursor) cursorPosts = [];
+        updateSqlInspector(reqMode, reqState);
         cursorPosts = [...cursorPosts, ...json.items];
         state.cursor = json.meta.nextCursor;
         state.hasNext = json.meta.hasNext;
         renderTable(cursorPosts);
-        document.getElementById('btnMore').disabled = !state.hasNext;
-        document.getElementById('btnMore').textContent = state.hasNext ? '다음 10개 더 불러오기 (Keyset)' : '더 이상 글이 없습니다';
+        updateMoreButton();
       }
     } catch (err) {
       if (err.name === 'AbortError') {
-        console.log('[AbortController] 이전 비동기 요청이 정상 취소되었습니다.');
-      } else {
-        console.error('Fetch error:', err);
+        console.log(`[AbortController] 이전 비동기 요청(#${seq})이 정상 취소되었습니다.`);
+        return;
       }
+      if (seq !== requestSeq) return;
+      console.error('Fetch error:', err);
+      showError(`데이터를 불러오지 못했습니다: ${err.message}`);
+      if (reqMode === 'cursor') updateMoreButton();
     }
+  }
+
+  function updateMoreButton() {
+    const btn = document.getElementById('btnMore');
+    btn.disabled = !state.hasNext;
+    btn.textContent = state.hasNext ? '다음 10개 더 불러오기 (Keyset)' : '더 이상 글이 없습니다';
+    document.getElementById('cursorCount').textContent = `현재 ${cursorPosts.length}건 표시`;
+  }
+
+  function showError(message) {
+    const box = document.getElementById('errorBox');
+    box.textContent = message;
+    box.style.display = 'block';
+  }
+  function hideError() {
+    document.getElementById('errorBox').style.display = 'none';
   }
 
   function renderTable(items) {
@@ -391,10 +509,10 @@
     tb.innerHTML = items.map(p => `
       <tr>
         <td style="color:#0066cc; font-weight:700;">${p.id}</td>
-        <td style="font-weight:600;">${p.title}</td>
-        <td>${p.author}</td>
+        <td style="font-weight:600;">${escapeHtml(p.title)}</td>
+        <td>${escapeHtml(p.author)}</td>
         <td style="color:#0066cc; font-weight:600;">${p.views.toLocaleString()}</td>
-        <td style="color:#8d9aaf;">${p.createdAt}</td>
+        <td style="color:#8d9aaf;">${escapeHtml(p.createdAt)}</td>
       </tr>
     `).join('');
   }
@@ -421,79 +539,92 @@
   }
 
   function goToPage(p) {
+    if (p === state.page) return;
     state.page = p;
-    loadData(true);
+    loadData({ history: 'push' });
   }
 
   function loadMoreCursor() {
     if (state.hasNext) {
-      loadData(false);
+      loadData({ reset: false });
     }
   }
 
-  function applySearch() {
-    state.search = document.getElementById('searchInput').value.trim();
+  // 검색 실행 공통 함수 (디바운스·조회 버튼·Enter 키에서 사용)
+  function runSearch() {
+    clearTimeout(debounceTimer);
+    const value = document.getElementById('searchInput').value.trim();
+    state.search = value;
     state.page = 1;
     state.cursor = null;
-    loadData(true);
+    loadData({ history: 'push', reset: true });
   }
 
-  function updateSqlInspector() {
-    const sqlBox = document.getElementById('inspectSql');
-    if (mode === 'offset') {
-      const offset = (state.page - 1) * state.limit;
-      let sortClause = 'created_at DESC, id DESC';
-      if (state.sort === 'views') sortClause = 'views DESC, id DESC';
-      else if (state.sort === 'oldest') sortClause = 'created_at ASC, id ASC';
+  function applySearch() {
+    runSearch();
+  }
 
-      let whereClause = state.search ? `WHERE (title LIKE '%${state.search}%' OR content LIKE '%${state.search}%') ` : '';
-      sqlBox.textContent = `SELECT id, title, author, views, created_at FROM posts ${whereClause}ORDER BY ${sortClause} LIMIT ${state.limit} OFFSET ${offset};`;
+  function updateSqlInspector(reqMode, s) {
+    const sqlBox = document.getElementById('inspectSql');
+    const where = [];
+    const params = [];
+    if (s.search) {
+      where.push('(title LIKE ? OR content LIKE ?)');
+      params.push(`%${s.search}%`, `%${s.search}%`);
+    }
+
+    if (reqMode === 'offset') {
+      const offset = (s.page - 1) * s.limit;
+      let sortClause = 'created_at DESC, id DESC';
+      if (s.sort === 'views') sortClause = 'views DESC, id DESC';
+      else if (s.sort === 'oldest') sortClause = 'created_at ASC, id ASC';
+      params.push(s.limit, offset);
+      const whereSql = where.length ? `WHERE ${where.join(' AND ')} ` : '';
+      sqlBox.textContent = `SELECT id, title, author, views, created_at FROM posts ${whereSql}ORDER BY ${sortClause} LIMIT ? OFFSET ?;\n-- params: ${JSON.stringify(params)}`;
     } else {
-      let whereClause = state.cursor ? `WHERE id < ${state.cursor} ` : '';
-      sqlBox.textContent = `SELECT id, title, author, views, created_at FROM posts ${whereClause}ORDER BY id DESC LIMIT ${state.limit + 1};`;
+      if (s.cursor) {
+        where.push('id < ?');
+        params.push(s.cursor);
+      }
+      params.push(s.limit + 1);
+      const whereSql = where.length ? `WHERE ${where.join(' AND ')} ` : '';
+      sqlBox.textContent = `SELECT id, title, author, views, created_at FROM posts ${whereSql}ORDER BY id DESC LIMIT ?;\n-- params: ${JSON.stringify(params)}`;
     }
   }
 
   // 300ms 디바운스 실시간 검색 인풋 이벤트
-  document.getElementById('searchInput').addEventListener('input', (e) => {
+  document.getElementById('searchInput').addEventListener('input', () => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      state.search = e.target.value.trim();
-      state.page = 1;
-      state.cursor = null;
-      loadData(true);
-    }, 300);
+    debounceTimer = setTimeout(runSearch, 300);
+  });
+
+  document.getElementById('searchInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) runSearch();
   });
 
   document.getElementById('sortSelect').addEventListener('change', (e) => {
-    state.sort = e.target.value;
+    state.sort = normalizeSort(e.target.value);
     state.page = 1;
     state.cursor = null;
-    loadData(true);
+    loadData({ history: 'push', reset: true });
   });
 
   // 뒤로 가기(popstate) 이벤트 처리
   window.addEventListener('popstate', () => {
-    const params = new URLSearchParams(window.location.search);
-    state.page = parseInt(params.get('page'), 10) || 1;
-    state.sort = params.get('sort') || 'latest';
-    state.search = params.get('search') || '';
-
-    document.getElementById('searchInput').value = state.search;
-    document.getElementById('sortSelect').value = state.sort;
-    loadData(false);
+    clearTimeout(debounceTimer);
+    restoreFromUrl();
+    if (mode !== 'offset') {
+      mode = 'offset';
+      applyModeUi();
+    }
+    loadData({ history: null });
   });
 
   // 초기 로드 시 주소창 파라미터 복원
   window.addEventListener('DOMContentLoaded', () => {
-    const params = new URLSearchParams(window.location.search);
-    state.page = parseInt(params.get('page'), 10) || 1;
-    state.sort = params.get('sort') || 'latest';
-    state.search = params.get('search') || '';
-
-    document.getElementById('searchInput').value = state.search;
-    document.getElementById('sortSelect').value = state.sort;
-    loadData(false);
+    restoreFromUrl();
+    applyModeUi();
+    loadData({ history: 'replace' });
   });
 </script>
 </body>
